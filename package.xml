@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>kairos_ros</name>
+  <version>1.0.0</version>
+  <description>ROS adapter for KAIROS (flow temporal ROS bridge).</description>
+  <maintainer email="iacopomcatalano@gmail.com">Iacopo Catalano</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- Depends on kairos (the library) + kairos_msgs, NOT on hydra_ros: a copy
+       of tf_lookup is vendored here so the dependency graph stays one-way
+       (kairos_ros -> kairos -> hydra). -->
+  <depend>kairos</depend>
+  <depend>kairos_msgs</depend>
+  <depend>hydra</depend>
+  <depend>config_utilities</depend>
+  <depend>roscpp</depend>
+  <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>odom_array_msgs</depend>
+  <depend>eigen</depend>
+
+  <!-- Optional: the rviz flow-arrow plugin (KAIROS_ROS_BUILD_PLUGIN=ON) also
+       needs hydra_visualizer. -->
+  <exec_depend>rospy</exec_depend>
+</package>

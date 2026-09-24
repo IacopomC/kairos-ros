@@ -1,0 +1,20 @@
+# build / install artifacts
+build/
+devel/
+install/
+logs/
+*.so
+*.o
+*.a
+*.pyc
+__pycache__/
+*.egg-info/
+.eggs/
+dist/
+_skbuild/
+# editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
