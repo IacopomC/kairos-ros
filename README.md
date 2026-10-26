@@ -28,7 +28,7 @@ with vcstool (see the [`kairos` README](https://github.com/IacopomC/kairos#insta
 
 ```bash
 mkdir -p kairos_ws/src && cd kairos_ws/src
-git clone https://github.com/IacopomC/kairos.git
+git clone -b archive/ros_noetic https://github.com/IacopomC/kairos.git
 vcs import . < kairos/install/kairos.rosinstall   # kairos-ros, kairos-msgs, hydra forks, deps
 ```
 
