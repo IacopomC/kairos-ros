@@ -14,15 +14,15 @@ Two markers are published:
 - flow_nudft_valid_voxels: cells whose model is MODEL_BASED
   (i.e., have a usable predictor).
 
-Parameters are ROS private params, not argparse:
+Parameters are ROS parameters, not argparse:
 
-    rosrun kairos_ros flow_voxel_publisher.py \
-        _scene_graph:=/out/run01/dsg.json \
-        _frame_id:=map _rate_hz:=1.0 _max_cells:=50000
+    ros2 run kairos_ros flow_voxel_publisher.py --ros-args \
+        -p scene_graph:=/out/run01/dsg.json \
+        -p frame_id:=map -p rate_hz:=1.0 -p max_cells:=50000
 
-Without `~scene_graph` the node warns and idles. `~frame_id` (map), `~topic`
-(/hydra_dsg_visualizer/flow_voxels), `~rate_hz` (1.0), `~stride` (1),
-`~max_cells` (50000) and `~voxel_size` (0.1, used only when the DSG carries no
+Without `scene_graph` the node warns and idles. `frame_id` (map), `topic`
+(/hydra_dsg_visualizer/flow_voxels), `rate_hz` (1.0), `stride` (1),
+`max_cells` (50000) and `voxel_size` (0.1, used only when the DSG carries no
 usable voxel size of its own) have defaults. A run whose temporal module was
 disabled carries no flow metadata, so nothing is published.
 """
@@ -31,8 +31,10 @@ import json
 import os
 import sys
 
-import rospy
+import rclpy
 from geometry_msgs.msg import Point
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -55,7 +57,7 @@ def derive_flag(cell):
     return "MODEL_BASED"
 
 
-def load_flow_from_dsg(scene_graph_path):
+def load_flow_from_dsg(scene_graph_path, logger):
     """Read graph.metadata.flow from a saved DSG JSON.
 
     Returns (cells, voxel_size). cells is a list of cell records as
@@ -70,18 +72,17 @@ def load_flow_from_dsg(scene_graph_path):
         return [], None
     flow_map = flow.get("map") or {}
     if flow_map.get("schema") != "hydra_flow_map_checkpoint":
-        rospy.logerr(
-            "[flow_voxel_publisher] DSG flow.map at %s has unexpected schema",
-            scene_graph_path,
+        logger.error(
+            f"[flow_voxel_publisher] DSG flow.map at {scene_graph_path} has unexpected schema"
         )
         return [], None
     return flow_map.get("cells", []), flow.get("voxel_size")
 
 
-def build_markers(cells, voxel_size, frame_id, stride, max_cells):
+def build_markers(cells, voxel_size, frame_id, stride, max_cells, stamp):
     observed = Marker()
     observed.header.frame_id = frame_id
-    observed.header.stamp = rospy.Time.now()
+    observed.header.stamp = stamp
     observed.ns = "flow_observed_voxels"
     observed.id = 0
     observed.type = Marker.CUBE_LIST
@@ -90,7 +91,7 @@ def build_markers(cells, voxel_size, frame_id, stride, max_cells):
     observed.scale.x = voxel_size
     observed.scale.y = voxel_size
     observed.scale.z = voxel_size
-    observed.color = ColorRGBA(0.2, 0.6, 1.0, 0.3)
+    observed.color = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.3)
 
     model_valid = Marker()
     model_valid.header = observed.header
@@ -102,7 +103,7 @@ def build_markers(cells, voxel_size, frame_id, stride, max_cells):
     model_valid.scale.x = voxel_size
     model_valid.scale.y = voxel_size
     model_valid.scale.z = voxel_size
-    model_valid.color = ColorRGBA(1.0, 0.2, 0.2, 0.7)
+    model_valid.color = ColorRGBA(r=1.0, g=0.2, b=0.2, a=0.7)
 
     count = 0
     for i, cell in enumerate(cells):
@@ -125,75 +126,80 @@ def build_markers(cells, voxel_size, frame_id, stride, max_cells):
     return MarkerArray(markers=[observed, model_valid])
 
 
-def main():
-    rospy.init_node("flow_voxel_publisher", anonymous=True)
+class FlowVoxelPublisher(Node):
+    """Publishes the flow voxels of a saved DSG."""
 
-    scene_graph_path = rospy.get_param("~scene_graph", "")
-    if not scene_graph_path:
-        rospy.logwarn(
-            "[flow_voxel_publisher] no scene_graph path provided; idling"
+    def __init__(self):
+        super().__init__("flow_voxel_publisher")
+        self._timer = None
+        scene_graph_path = self.declare_parameter("scene_graph", "").value
+        if not scene_graph_path:
+            self.get_logger().warning("[flow_voxel_publisher] no scene_graph path provided; idling")
+            return
+
+        if not os.path.exists(scene_graph_path):
+            self.get_logger().error(
+                f"[flow_voxel_publisher] scene_graph not found: {scene_graph_path}"
+            )
+            sys.exit(1)
+
+        cells, voxel_size = load_flow_from_dsg(scene_graph_path, self.get_logger())
+        if not cells:
+            self.get_logger().warning(
+                f"[flow_voxel_publisher] DSG at {scene_graph_path} has no flow.map metadata; "
+                "either the run didn't enable the temporal module, or the artifact "
+                "predates flow_map embedding. Idling."
+            )
+            return
+
+        if voxel_size is None or voxel_size <= 0.0:
+            voxel_size = float(self.declare_parameter("voxel_size", 0.1).value)
+        if voxel_size <= 0.0:
+            self.get_logger().error(
+                f"[flow_voxel_publisher] non-positive voxel_size {voxel_size}; aborting"
+            )
+            sys.exit(1)
+
+        frame_id = self.declare_parameter("frame_id", "map").value
+        topic = self.declare_parameter("topic", "/hydra_dsg_visualizer/flow_voxels").value
+        rate_hz = float(self.declare_parameter("rate_hz", 1.0).value)
+        stride = int(self.declare_parameter("stride", 1).value)
+        max_cells = int(self.declare_parameter("max_cells", 50000).value)
+
+        self.get_logger().info(
+            f"[flow_voxel_publisher] loaded {len(cells)} cells from DSG metadata "
+            f"(voxel_size={voxel_size:.3f})"
         )
-        rospy.spin()
-        return
 
-    if not os.path.exists(scene_graph_path):
-        rospy.logerr(
-            "[flow_voxel_publisher] scene_graph not found: %s", scene_graph_path
+        # latched, as in ROS 1
+        qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._pub = self.create_publisher(MarkerArray, topic, qos)
+        self._msg = build_markers(
+            cells, voxel_size, frame_id, stride, max_cells, self.get_clock().now().to_msg()
         )
-        sys.exit(1)
+        self._pub.publish(self._msg)
+        if rate_hz > 0.0:
+            self._timer = self.create_timer(1.0 / rate_hz, self._republish)
 
-    cells, voxel_size = load_flow_from_dsg(scene_graph_path)
-    if not cells:
-        rospy.logwarn(
-            "[flow_voxel_publisher] DSG at %s has no flow.map metadata; "
-            "either the run didn't enable the temporal module, or the artifact "
-            "predates flow_map embedding. Idling.",
-            scene_graph_path,
-        )
-        rospy.spin()
-        return
-
-    if voxel_size is None or voxel_size <= 0.0:
-        voxel_size = float(rospy.get_param("~voxel_size", 0.1))
-    if voxel_size <= 0.0:
-        rospy.logerr(
-            "[flow_voxel_publisher] non-positive voxel_size %s; aborting",
-            voxel_size,
-        )
-        sys.exit(1)
-
-    frame_id = rospy.get_param("~frame_id", "map")
-    topic = rospy.get_param("~topic", "/hydra_dsg_visualizer/flow_voxels")
-    rate_hz = float(rospy.get_param("~rate_hz", 1.0))
-    stride = int(rospy.get_param("~stride", 1))
-    max_cells = int(rospy.get_param("~max_cells", 50000))
-
-    rospy.loginfo(
-        "[flow_voxel_publisher] loaded %d cells from DSG metadata (voxel_size=%.3f)",
-        len(cells),
-        voxel_size,
-    )
-
-    pub = rospy.Publisher(topic, MarkerArray, queue_size=1, latch=True)
-    msg = build_markers(cells, voxel_size, frame_id, stride, max_cells)
-
-    if rate_hz <= 0.0:
-        pub.publish(msg)
-        rospy.spin()
-        return
-
-    rate = rospy.Rate(rate_hz)
-    while not rospy.is_shutdown():
+    def _republish(self):
         # rebuild stamps so RViz doesn't drop them after a TF clock reset
-        now = rospy.Time.now()
-        for marker in msg.markers:
+        now = self.get_clock().now().to_msg()
+        for marker in self._msg.markers:
             marker.header.stamp = now
-        pub.publish(msg)
-        rate.sleep()
+        self._pub.publish(self._msg)
+
+
+def main():
+    rclpy.init()
+    node = FlowVoxelPublisher()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except rospy.ROSInterruptException:
-        pass
+    main()

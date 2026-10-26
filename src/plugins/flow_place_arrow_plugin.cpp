@@ -36,6 +36,7 @@
 #include "kairos_ros/plugins/flow_place_arrow_plugin.h"
 
 #include <config_utilities/config.h>
+#include <config_utilities/factory.h>
 #include <config_utilities/validation.h>
 #include <spark_dsg/node_attributes.h>
 
@@ -43,11 +44,22 @@
 #include <cmath>
 
 namespace kairos {
+
+namespace {
+
+const auto registration =
+    config::RegistrationWithConfig<VisualizerPlugin,
+                                   FlowPlaceArrowPlugin,
+                                   FlowPlaceArrowPlugin::Config,
+                                   ianvs::NodeHandle,
+                                   std::string>("FlowPlaceArrowPlugin");
+
+}  // namespace
 using namespace hydra;  // base-Hydra + hydra_ros/visualizer types
 
 using spark_dsg::DynamicSceneGraph;
-using visualization_msgs::Marker;
-using visualization_msgs::MarkerArray;
+using visualization_msgs::msg::Marker;
+using visualization_msgs::msg::MarkerArray;
 
 namespace {
 
@@ -173,13 +185,13 @@ void declare_config(FlowPlaceArrowPlugin::Config& config) {
 }
 
 FlowPlaceArrowPlugin::FlowPlaceArrowPlugin(const Config& config,
-                                           const ros::NodeHandle& nh,
+                                           ianvs::NodeHandle nh,
                                            const std::string& name)
-    : VisualizerPlugin(nh, name), config(config::checkValid(config)) {
-  pub_ = nh_.advertise<MarkerArray>("", 1, true);
-}
+    : VisualizerPlugin(name),
+      config(config::checkValid(config)),
+      pub_(nh.create_publisher<MarkerArray>(name, rclcpp::QoS(1).transient_local())) {}
 
-void FlowPlaceArrowPlugin::draw(const std_msgs::Header& header,
+void FlowPlaceArrowPlugin::draw(const std_msgs::msg::Header& header,
                                 const DynamicSceneGraph& graph) {
   if (!pub_) {
     return;
@@ -188,29 +200,29 @@ void FlowPlaceArrowPlugin::draw(const std_msgs::Header& header,
   MarkerArray msg;
   int marker_id = 0;
 
-  for (const int layer_id : config.layers) {
-    if (!graph.hasLayer(layer_id)) {
+  for (const auto& layer_name : config.layers) {
+    if (!graph.hasLayer(layer_name)) {
       continue;
     }
 
-    const auto& layer = graph.getLayer(layer_id);
-    const std::string ns = "flow_place_arrows_" + std::to_string(layer_id);
+    const auto& layer = graph.getLayer(layer_name);
+    const std::string ns = "flow_place_arrows_" + layer_name;
 
     for (const auto& id_node_pair : layer.nodes()) {
       const auto& attrs = id_node_pair.second->attributes();
-      if (!hasFlowSupport(attrs.metadata, config.num_components_key)) {
+      if (!hasFlowSupport(attrs.metadata(), config.num_components_key)) {
         continue;
       }
 
-      const double confidence = clamp01(readDouble(attrs.metadata, config.confidence_key, 1.0));
-      const bool show_dominant_overlay = readBool(attrs.metadata, "flow_use_fixed_components", false);
+      const double confidence = clamp01(readDouble(attrs.metadata(), config.confidence_key, 1.0));
+      const bool show_dominant_overlay = readBool(attrs.metadata(), "flow_use_fixed_components", false);
       const double base_z =
           config.use_uniform_z ? config.uniform_z : attrs.position.z();
 
       bool emitted_component_arrow = false;
-      if (attrs.metadata.contains(config.components_key) &&
-          attrs.metadata.at(config.components_key).is_array()) {
-        for (const auto& component : attrs.metadata.at(config.components_key)) {
+      if (attrs.metadata().contains(config.components_key) &&
+          attrs.metadata().at(config.components_key).is_array()) {
+        for (const auto& component : attrs.metadata().at(config.components_key)) {
           double theta = 0.0;
           double rho = 0.0;
           double weight = 0.0;
@@ -242,13 +254,13 @@ void FlowPlaceArrowPlugin::draw(const std_msgs::Header& header,
           marker.scale.y = config.head_base_diameter + config.head_scale * weight;
           marker.scale.z = config.head_base_length + config.head_scale_length * weight;
 
-          geometry_msgs::Point start;
+          geometry_msgs::msg::Point start;
           start.x = attrs.position.x();
           start.y = attrs.position.y();
           start.z = base_z;
           marker.points.push_back(start);
 
-          geometry_msgs::Point end;
+          geometry_msgs::msg::Point end;
           end.x = attrs.position.x() + arrow_length * std::cos(theta);
           end.y = attrs.position.y() + arrow_length * std::sin(theta);
           end.z = base_z;
@@ -268,8 +280,8 @@ void FlowPlaceArrowPlugin::draw(const std_msgs::Header& header,
         continue;
       }
 
-      const double theta = readDouble(attrs.metadata, "flow_dominant_theta", 0.0);
-      const double rho = std::max(0.0, readDouble(attrs.metadata, "flow_dominant_rho", 0.0));
+      const double theta = readDouble(attrs.metadata(), "flow_dominant_theta", 0.0);
+      const double rho = std::max(0.0, readDouble(attrs.metadata(), "flow_dominant_rho", 0.0));
       const double arrow_length = std::clamp(config.length_scale * rho,
                                              config.min_arrow_length,
                                              config.max_arrow_length);
@@ -288,13 +300,13 @@ void FlowPlaceArrowPlugin::draw(const std_msgs::Header& header,
       marker.scale.y = config.head_base_diameter + config.head_scale;
       marker.scale.z = config.head_base_length + config.head_scale_length;
 
-      geometry_msgs::Point start;
+      geometry_msgs::msg::Point start;
       start.x = attrs.position.x();
       start.y = attrs.position.y();
       start.z = base_z + (emitted_component_arrow ? 0.08 : 0.0);
       marker.points.push_back(start);
 
-      geometry_msgs::Point end;
+      geometry_msgs::msg::Point end;
       end.x = attrs.position.x() + arrow_length * std::cos(theta);
       end.y = attrs.position.y() + arrow_length * std::sin(theta);
       end.z = base_z + (emitted_component_arrow ? 0.08 : 0.0);
@@ -318,15 +330,15 @@ void FlowPlaceArrowPlugin::draw(const std_msgs::Header& header,
 
   tracker_.clearPrevious(header, msg);
   if (!msg.markers.empty()) {
-    pub_.publish(msg);
+    pub_->publish(msg);
   }
 }
 
-void FlowPlaceArrowPlugin::reset(const std_msgs::Header& header) {
+void FlowPlaceArrowPlugin::reset(const std_msgs::msg::Header& header) {
   MarkerArray msg;
   tracker_.clearPrevious(header, msg);
   if (!msg.markers.empty()) {
-    pub_.publish(msg);
+    pub_->publish(msg);
   }
 }
 

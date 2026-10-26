@@ -2,27 +2,31 @@
 <package format="3">
   <name>kairos_ros</name>
   <version>1.0.0</version>
-  <description>ROS adapter for KAIROS (flow temporal ROS bridge).</description>
+  <description>ROS 2 adapter for KAIROS (flow temporal ROS bridge and visualizer plugins).</description>
   <maintainer email="iacopomcatalano@gmail.com">Iacopo Catalano</maintainer>
   <license>MIT</license>
 
-  <buildtool_depend>catkin</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <!-- Depends on kairos (the library) + kairos_msgs, NOT on hydra_ros: a copy
-       of tf_lookup is vendored here so the dependency graph stays one-way
-       (kairos_ros -> kairos -> hydra). -->
+  <!-- hydra_ros knows nothing about Kairos, so depending on it keeps the graph
+       one-way (kairos_ros -> hydra_ros, kairos -> hydra). -->
   <depend>kairos</depend>
   <depend>kairos_msgs</depend>
   <depend>hydra</depend>
+  <depend>hydra_ros</depend>
+  <depend>hydra_visualizer</depend>
+  <depend>ianvs</depend>
   <depend>config_utilities</depend>
-  <depend>roscpp</depend>
-  <depend>tf2_ros</depend>
-  <depend>visualization_msgs</depend>
+  <depend>rclcpp</depend>
   <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
   <depend>odom_array_msgs</depend>
   <depend>eigen</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>spark_dsg</exec_depend>
 
-  <!-- Optional: the rviz flow-arrow plugin (KAIROS_ROS_BUILD_PLUGIN=ON) also
-       needs hydra_visualizer. -->
-  <exec_depend>rospy</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
 </package>

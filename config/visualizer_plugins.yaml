@@ -1,0 +1,10 @@
+---
+# Kairos visualizer plugins, loaded from the kairos_ros_viz library.
+external_libraries: {enabled: true}
+external_library_paths: [hydra_ros, kairos_ros_viz]
+plugins:
+  flow_place_arrows:
+    type: FlowPlaceArrowPlugin
+    layers: [PLACES]
+    use_uniform_z: true
+    uniform_z: 19.0

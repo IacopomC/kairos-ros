@@ -35,7 +35,9 @@
 #pragma once
 
 #include <config_utilities/factory.h>
-#include <visualization_msgs/MarkerArray.h>
+#include <ianvs/node_handle.h>
+#include <spark_dsg/scene_graph_types.h>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "hydra_visualizer/plugins/visualizer_plugin.h"
 #include "hydra_visualizer/utils/marker_tracker.h"
@@ -46,7 +48,7 @@ using namespace hydra;  // base-Hydra + hydra_ros/visualizer types
 class FlowPlaceArrowPlugin : public VisualizerPlugin {
  public:
   struct Config {
-    std::vector<int> layers{3};
+    std::vector<std::string> layers{spark_dsg::DsgLayers::PLACES};
     std::string occupancy_key = "flow_occupancy";
     std::string confidence_key = "flow_confidence";
     std::string components_key = "flow_components";
@@ -76,26 +78,19 @@ class FlowPlaceArrowPlugin : public VisualizerPlugin {
   } const config;
 
   FlowPlaceArrowPlugin(const Config& config,
-                       const ros::NodeHandle& nh,
+                       ianvs::NodeHandle nh,
                        const std::string& name);
 
   ~FlowPlaceArrowPlugin() override = default;
 
-  void draw(const std_msgs::Header& header,
+  void draw(const std_msgs::msg::Header& header,
             const spark_dsg::DynamicSceneGraph& graph) override;
 
-  void reset(const std_msgs::Header& header) override;
+  void reset(const std_msgs::msg::Header& header) override;
 
  private:
-  ros::Publisher pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_;
   mutable MarkerTracker tracker_;
-
-  inline static const auto registration_ =
-      config::RegistrationWithConfig<VisualizerPlugin,
-                                     FlowPlaceArrowPlugin,
-                                     FlowPlaceArrowPlugin::Config,
-                                     ros::NodeHandle,
-                                     std::string>("FlowPlaceArrowPlugin");
 };
 
 void declare_config(FlowPlaceArrowPlugin::Config& config);

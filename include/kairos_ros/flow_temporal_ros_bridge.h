@@ -1,33 +1,33 @@
 #pragma once
 
-#include <hydra/active_window/active_window_module.h>
-#include <hydra/backend/backend_module.h>
 #include <hydra/common/module.h>
+#include <hydra_ros/utils/tf_lookup.h>
+#include <ianvs/node_handle.h>
 #include <kairos/flow/flow_map.h>
-#include <hydra/reconstruction/volumetric_map.h>
 #include <kairos/temporal/flow_temporal_module.h>
-#include <kairos_msgs/QueryFlow.h>
-#include <odom_array_msgs/OdometryArray.h>
-#include <ros/ros.h>
-#include <visualization_msgs/MarkerArray.h>
 
 #include <cstdint>
+#include <kairos_msgs/srv/query_flow.hpp>
 #include <memory>
-#include <mutex>
+#include <odom_array_msgs/msg/odometry_array.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <string>
 #include <vector>
-
-#include "kairos_ros/utils/tf_lookup.h"
+#include <visualization_msgs/msg/marker_array.hpp>
 
 namespace kairos {
 using namespace hydra;  // base-Hydra + hydra_ros/visualizer types
 
 // Thin ROS adapter around the non-ROS `FlowTemporalModule` core. Owns the
 // ROS subscribers / publishers / service / TF lookup and forwards decoded
-// detection frames into the core via `pushDetectionFrame`.
+// detection frames into the core via `pushDetectionFrame`. Created by Hydra-ROS
+// from its `modules` config ("FlowTemporalRosBridge"); map and backend updates
+// reach the core through FlowMapSink and FlowUpdateFunctor, which find it by
+// name.
 class FlowTemporalRosBridge : public Module {
  public:
   struct Config : public FlowTemporalModule::Config {
+    //! Namespace of the topics and service, under the node's ~/flow_temporal
     std::string ns = "";
     std::string world_frame = "map";
     std::string observations_topic = "temporal/odometry_array";
@@ -39,41 +39,32 @@ class FlowTemporalRosBridge : public Module {
     TFLookup::Config tf_lookup;
   } const config;
 
-  FlowTemporalRosBridge(const Config& config, const ros::NodeHandle& nh);
+  explicit FlowTemporalRosBridge(const Config& config);
   ~FlowTemporalRosBridge() override;
 
   void start() override;
   void stop() override;
-  void save(const LogSetup& setup) override;
+  void save(const DataDirectory& output) override;
   std::string printInfo() const override;
 
-  // Forward map / backend updates to the core. Same signatures as the
-  // historical `FlowTemporalModule::handleMapUpdate / handleBackendUpdate`,
-  // so existing `ActiveWindowModule::Sink::fromMethod` / `BackendModule::
-  // Sink::fromMethod` wiring at the call site keeps working.
-  void handleMapUpdate(uint64_t timestamp_ns,
-                       const VolumetricMap& map,
-                       const ActiveWindowOutput& msg);
-
-  void handleBackendUpdate(uint64_t timestamp_ns,
-                           const DynamicSceneGraph& graph,
-                           const kimera_pgmo::DeformationGraph& dgraph);
-
  private:
-  void detectionsCallback(const odom_array_msgs::OdometryArray::ConstPtr& msg);
-  bool queryFlowCallback(kairos_msgs::QueryFlow::Request& req,
-                         kairos_msgs::QueryFlow::Response& res);
+  using OdometryArray = odom_array_msgs::msg::OdometryArray;
+  using QueryFlow = kairos_msgs::srv::QueryFlow;
+  using MarkerArray = visualization_msgs::msg::MarkerArray;
+
+  void detectionsCallback(const OdometryArray::ConstSharedPtr& msg);
+  void queryFlowCallback(const QueryFlow::Request::SharedPtr req,
+                         QueryFlow::Response::SharedPtr res);
   void publishVoxelMarkers(double timestamp_s);
   void publishMergeEvents(double timestamp_s);
   void publishMetrics(double timestamp_s);
 
-  ros::NodeHandle nh_;
-  ros::NodeHandle pnh_;
-  ros::Subscriber detections_sub_;
-  ros::Publisher metrics_pub_;
-  ros::Publisher voxel_markers_pub_;
-  ros::Publisher loop_closure_merges_pub_;
-  ros::ServiceServer query_flow_srv_;
+  ianvs::NodeHandle nh_;
+  rclcpp::Subscription<OdometryArray>::SharedPtr detections_sub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr metrics_pub_;
+  rclcpp::Publisher<MarkerArray>::SharedPtr voxel_markers_pub_;
+  rclcpp::Publisher<MarkerArray>::SharedPtr loop_closure_merges_pub_;
+  rclcpp::Service<QueryFlow>::SharedPtr query_flow_srv_;
   size_t total_merges_ = 0;
   size_t last_remap_merge_count_ = 0;
   int64_t last_total_observations_pre_remap_ = 0;

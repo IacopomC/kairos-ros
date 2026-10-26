@@ -1,0 +1,52 @@
+---
+# Hydra with the Kairos flow module, for a live robot or a replayed bag.
+#
+# Hydra-ROS runs unchanged: this loads the kairos_ros library into it, uses a
+# Kairos dataset config as the Hydra config, and runs the flow module as the ROS
+# bridge (FlowTemporalRosBridge), which subscribes to the detections and serves
+# QueryFlow.
+#
+#   ros2 launch kairos_ros kairos.launch.yaml dataset:=tbd \
+#       input:=unizar labelspace:=ade20k_outdoor robot_frame:=base_link
+launch:
+  - arg: {name: dataset, description: Kairos dataset config (kairos/config/datasets)}
+  - arg: {name: input, description: ROS input config (kairos_ros/config/datasets)}
+  - arg: {name: labelspace, default: ade20k_outdoor, description: Closed-set label space}
+  - arg: {name: robot_frame, default: base_link, description: Robot body tf frame}
+  - arg: {name: odom_frame, default: odom, description: Odometry frame}
+  - arg: {name: map_frame, default: map, description: Backend scene graph frame}
+  - arg: {name: use_sim_time, default: 'false', description: Use ROS sim time}
+  - arg: {name: observations_topic, default: /people_detections_odom, description: odom_array_msgs/OdometryArray detections}
+  - arg: {name: metrics_topic, default: temporal/flow_metrics}
+  - arg: {name: publish_metrics, default: 'true'}
+  - arg: {name: publish_voxel_markers, default: 'true'}
+  - arg: {name: start_visualizer, default: 'true'}
+  - let:
+      name: kairos_yaml
+      value: >-
+        {external_libraries: {enabled: true}, paths: [kairos_ros],
+        modules: {flow_temporal: {type: FlowTemporalRosBridge,
+        world_frame: $(var map_frame), observations_topic: $(var observations_topic),
+        metrics_topic: $(var metrics_topic), publish_metrics: $(var publish_metrics),
+        publish_voxel_markers: $(var publish_voxel_markers)}}}
+  - include:
+      file: $(find-pkg-share hydra_ros)/launch/hydra.launch.yaml
+      arg:
+        - {name: dataset, value: $(var dataset)}
+        - {name: labelspace, value: $(var labelspace)}
+        - {name: robot_frame, value: $(var robot_frame)}
+        - {name: odom_frame, value: $(var odom_frame)}
+        - {name: map_frame, value: $(var map_frame)}
+        - {name: use_sim_time, value: $(var use_sim_time)}
+        - {name: hydra_config_path, value: $(find-pkg-share kairos)/config/datasets/$(var dataset).yaml}
+        - {name: input_config_path, value: $(find-pkg-share kairos_ros)/config/datasets/$(var input).yaml}
+        - {name: labelspace_path, value: $(find-pkg-share kairos)/config/label_spaces/$(var labelspace)_label_space.yaml}
+        - {name: extra_yaml, value: $(var kairos_yaml)}
+        - {name: start_visualizer, value: 'false'}
+  - set_remap: {from: hydra_visualizer/dsg, to: hydra/backend/dsg}
+  - include:
+      if: $(var start_visualizer)
+      file: $(find-pkg-share hydra_visualizer)/launch/streaming_visualizer.launch.yaml
+      arg:
+        - {name: visualizer_config_path, value: $(find-pkg-share kairos_ros)/config/visualizer_config.yaml}
+        - {name: external_plugins_path, value: $(find-pkg-share kairos_ros)/config/visualizer_plugins.yaml}

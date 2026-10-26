@@ -1,11 +1,15 @@
 #include "kairos_ros/flow_temporal_ros_bridge.h"
 
 #include <config_utilities/config.h>
+#include <config_utilities/factory.h>
 #include <config_utilities/printing.h>
 #include <config_utilities/validation.h>
+#include <glog/logging.h>
 #include <kairos/flow/flow_map.h>
-#include <std_msgs/String.h>
-#include <visualization_msgs/Marker.h>
+
+#include <geometry_msgs/msg/point.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 
 #include <cctype>
 #include <cmath>
@@ -19,11 +23,25 @@ using namespace hydra;  // base-Hydra + hydra_ros/visualizer types
 
 namespace {
 
-double toTimestampSeconds(const ros::Time& stamp) {
-  if (stamp.isZero()) {
-    return ros::Time::now().toSec();
+using visualization_msgs::msg::Marker;
+
+const auto registration =
+    config::RegistrationWithConfig<hydra::Module,
+                                   FlowTemporalRosBridge,
+                                   FlowTemporalRosBridge::Config>("FlowTemporalRosBridge");
+
+// ~/flow_temporal, the namespace the ROS 1 pipeline gave the bridge
+ianvs::NodeHandle makeNodeHandle(const std::string& ns) {
+  const auto nh = ianvs::NodeHandle::this_node("~") / "flow_temporal";
+  return ns.empty() ? nh : nh / ns;
+}
+
+double toTimestampSeconds(const builtin_interfaces::msg::Time& stamp,
+                          const ianvs::NodeHandle& nh) {
+  if (stamp.sec == 0 && stamp.nanosec == 0) {
+    return nh.now().seconds();
   }
-  return stamp.toSec();
+  return rclcpp::Time(stamp).seconds();
 }
 
 // Track id of a detection: the trailing integer of its child_frame_id
@@ -59,11 +77,9 @@ void declare_config(FlowTemporalRosBridge::Config& config) {
   field(config.tf_lookup, "tf_lookup");
 }
 
-FlowTemporalRosBridge::FlowTemporalRosBridge(const Config& config,
-                                             const ros::NodeHandle& nh)
+FlowTemporalRosBridge::FlowTemporalRosBridge(const Config& config)
     : config(config::checkValid(config)),
-      nh_(nh),
-      pnh_(nh_, config.ns),
+      nh_(makeNodeHandle(config.ns)),
       tf_lookup_(config.tf_lookup),
       core_(static_cast<const FlowTemporalModule::Config&>(config)) {}
 
@@ -75,23 +91,30 @@ void FlowTemporalRosBridge::start() {
   }
   started_ = true;
 
-  detections_sub_ = pnh_.subscribe(
-      config.observations_topic, 1, &FlowTemporalRosBridge::detectionsCallback, this);
+  detections_sub_ = nh_.create_subscription<OdometryArray>(
+      config.observations_topic,
+      rclcpp::QoS(1),
+      [this](const OdometryArray::ConstSharedPtr& msg) { detectionsCallback(msg); });
 
   if (config.publish_metrics) {
-    metrics_pub_ = pnh_.advertise<std_msgs::String>(config.metrics_topic, 1, false);
+    metrics_pub_ =
+        nh_.create_publisher<std_msgs::msg::String>(config.metrics_topic, rclcpp::QoS(1));
   }
 
   if (config.publish_voxel_markers) {
-    voxel_markers_pub_ = pnh_.advertise<visualization_msgs::MarkerArray>(
-        config.voxel_markers_topic, 1, true);
+    // latched, as in ROS 1
+    voxel_markers_pub_ = nh_.create_publisher<MarkerArray>(
+        config.voxel_markers_topic, rclcpp::QoS(1).transient_local());
   }
 
-  loop_closure_merges_pub_ = pnh_.advertise<visualization_msgs::MarkerArray>(
-      config.loop_closure_merges_topic, 10, false);
+  loop_closure_merges_pub_ = nh_.create_publisher<MarkerArray>(
+      config.loop_closure_merges_topic, rclcpp::QoS(10));
 
-  query_flow_srv_ = pnh_.advertiseService(
-      "query_flow", &FlowTemporalRosBridge::queryFlowCallback, this);
+  query_flow_srv_ = nh_.create_service<QueryFlow>(
+      "query_flow",
+      [this](const QueryFlow::Request::SharedPtr req, QueryFlow::Response::SharedPtr res) {
+        queryFlowCallback(req, res);
+      });
 
   core_.setTickCallback([this](double timestamp_s) {
     publishVoxelMarkers(timestamp_s);
@@ -109,52 +132,38 @@ void FlowTemporalRosBridge::stop() {
 
   core_.stop();
 
-  detections_sub_.shutdown();
-  metrics_pub_.shutdown();
-  voxel_markers_pub_.shutdown();
-  loop_closure_merges_pub_.shutdown();
+  detections_sub_.reset();
+  metrics_pub_.reset();
+  voxel_markers_pub_.reset();
+  loop_closure_merges_pub_.reset();
+  query_flow_srv_.reset();
   started_ = false;
 }
 
-void FlowTemporalRosBridge::save(const LogSetup& setup) { core_.save(setup); }
+void FlowTemporalRosBridge::save(const DataDirectory& output) { core_.save(output); }
 
 std::string FlowTemporalRosBridge::printInfo() const {
   return config::toString(config);
 }
 
-void FlowTemporalRosBridge::handleMapUpdate(uint64_t timestamp_ns,
-                                            const VolumetricMap& map,
-                                            const ActiveWindowOutput& msg) {
-  core_.handleMapUpdate(timestamp_ns, map, msg);
-}
-
-void FlowTemporalRosBridge::handleBackendUpdate(
-    uint64_t timestamp_ns,
-    const DynamicSceneGraph& graph,
-    const kimera_pgmo::DeformationGraph& dgraph) {
-  core_.handleBackendUpdate(timestamp_ns, graph, dgraph);
-}
-
-void FlowTemporalRosBridge::detectionsCallback(
-    const odom_array_msgs::OdometryArray::ConstPtr& msg) {
+void FlowTemporalRosBridge::detectionsCallback(const OdometryArray::ConstSharedPtr& msg) {
   if (!msg) {
     return;
   }
 
   Eigen::Isometry3d world_T_source = Eigen::Isometry3d::Identity();
   if (!msg->header.frame_id.empty() && msg->header.frame_id != config.world_frame) {
-    const std::optional<ros::Time> stamp =
-        config.use_detection_stamp_for_tf ? std::optional<ros::Time>(msg->header.stamp)
-                                          : std::nullopt;
-    const std::optional<size_t> max_tries =
-        config.tf_lookup.max_tries > 0 ? std::optional<size_t>(config.tf_lookup.max_tries)
-                                       : std::nullopt;
+    const std::optional<rclcpp::Time> stamp =
+        config.use_detection_stamp_for_tf
+            ? std::optional<rclcpp::Time>(rclcpp::Time(msg->header.stamp))
+            : std::nullopt;
 
+    // 0 tries means keep trying
     const auto world_T_msg = lookupTransform(tf_lookup_.buffer,
                                              stamp,
                                              config.world_frame,
                                              msg->header.frame_id,
-                                             max_tries,
+                                             config.tf_lookup.max_tries,
                                              config.tf_lookup.wait_duration_s,
                                              config.tf_lookup.verbosity);
     if (!world_T_msg) {
@@ -194,42 +203,42 @@ void FlowTemporalRosBridge::detectionsCallback(
     track_ids.push_back(parseTrackId(odom.child_frame_id));
   }
 
-  const double timestamp_s = toTimestampSeconds(msg->header.stamp);
+  const double timestamp_s = toTimestampSeconds(msg->header.stamp, nh_);
   core_.pushDetections(timestamp_s, xyz_world, theta, rho, track_ids);
 }
 
-bool FlowTemporalRosBridge::queryFlowCallback(kairos_msgs::QueryFlow::Request& req,
-                                              kairos_msgs::QueryFlow::Response& res) {
-  const size_t n = req.x.size();
-  if (req.y.size() != n || req.z.size() != n) {
-    ROS_WARN("QueryFlow: x/y/z arrays must have the same length");
-    return false;
+void FlowTemporalRosBridge::queryFlowCallback(const QueryFlow::Request::SharedPtr req,
+                                              QueryFlow::Response::SharedPtr res) {
+  // ROS 2 services can't fail a call, so an invalid query gets empty arrays
+  const size_t n = req->x.size();
+  if (req->y.size() != n || req->z.size() != n) {
+    LOG(WARNING) << "QueryFlow: x/y/z arrays must have the same length";
+    return;
   }
 
-  res.dominant_theta.resize(n);
-  res.dominant_rho.resize(n);
-  res.probability.resize(n);
-  res.flags.resize(n);
-  res.num_components.resize(n);
+  res->dominant_theta.resize(n);
+  res->dominant_rho.resize(n);
+  res->probability.resize(n);
+  res->flags.resize(n);
+  res->num_components.resize(n);
 
   for (size_t i = 0; i < n; ++i) {
-    const Eigen::Vector3f pos(static_cast<float>(req.x[i]),
-                              static_cast<float>(req.y[i]),
-                              static_cast<float>(req.z[i]));
-    const auto result = core_.queryFlowAtPosition(pos, req.query_time_s, req.horizon_s);
+    const Eigen::Vector3f pos(static_cast<float>(req->x[i]),
+                              static_cast<float>(req->y[i]),
+                              static_cast<float>(req->z[i]));
+    const auto result = core_.queryFlowAtPosition(pos, req->query_time_s, req->horizon_s);
     if (!result.has_value()) {
-      ROS_WARN_THROTTLE(5.0, "QueryFlow: voxel grid not yet initialized");
-      return false;
+      LOG_EVERY_T(WARNING, 5.0) << "QueryFlow: voxel grid not yet initialized";
+      *res = QueryFlow::Response();
+      return;
     }
 
-    res.dominant_theta[i] = result->dominant_theta;
-    res.dominant_rho[i] = result->dominant_rho;
-    res.probability[i] = result->probability;
-    res.flags[i] = result->flag;
-    res.num_components[i] = result->num_components;
+    res->dominant_theta[i] = result->dominant_theta;
+    res->dominant_rho[i] = result->dominant_rho;
+    res->probability[i] = result->probability;
+    res->flags[i] = result->flag;
+    res->num_components[i] = result->num_components;
   }
-
-  return true;
 }
 
 void FlowTemporalRosBridge::publishVoxelMarkers(double timestamp_s) {
@@ -237,7 +246,7 @@ void FlowTemporalRosBridge::publishVoxelMarkers(double timestamp_s) {
     return;
   }
 
-  if (voxel_markers_pub_.getNumSubscribers() == 0) {
+  if (voxel_markers_pub_->get_subscription_count() == 0) {
     return;
   }
 
@@ -252,13 +261,13 @@ void FlowTemporalRosBridge::publishVoxelMarkers(double timestamp_s) {
                                                        config.voxel_markers_stride,
                                                        config.voxel_markers_max_cells);
 
-  visualization_msgs::Marker observed;
+  Marker observed;
   observed.header.frame_id = config.world_frame;
-  observed.header.stamp = ros::Time::now();
+  observed.header.stamp = nh_.now();
   observed.ns = "flow_observed_voxels";
   observed.id = 0;
-  observed.type = visualization_msgs::Marker::CUBE_LIST;
-  observed.action = visualization_msgs::Marker::ADD;
+  observed.type = Marker::CUBE_LIST;
+  observed.action = Marker::ADD;
   observed.pose.orientation.w = 1.0;
   observed.scale.x = voxel_size;
   observed.scale.y = voxel_size;
@@ -268,7 +277,7 @@ void FlowTemporalRosBridge::publishVoxelMarkers(double timestamp_s) {
   observed.color.b = 1.0f;
   observed.color.a = 0.3f;
 
-  visualization_msgs::Marker model_valid = observed;
+  Marker model_valid = observed;
   model_valid.ns = "flow_nudft_valid_voxels";
   model_valid.id = 1;
   model_valid.color.r = 1.0f;
@@ -277,7 +286,7 @@ void FlowTemporalRosBridge::publishVoxelMarkers(double timestamp_s) {
   model_valid.color.a = 0.7f;
 
   for (const auto& sample : samples) {
-    geometry_msgs::Point p;
+    geometry_msgs::msg::Point p;
     p.x = (static_cast<double>(sample.index.x()) + 0.5) * static_cast<double>(voxel_size);
     p.y = (static_cast<double>(sample.index.y()) + 0.5) * static_cast<double>(voxel_size);
     p.z = (static_cast<double>(sample.index.z()) + 0.5) * static_cast<double>(voxel_size);
@@ -289,10 +298,10 @@ void FlowTemporalRosBridge::publishVoxelMarkers(double timestamp_s) {
     }
   }
 
-  visualization_msgs::MarkerArray out;
+  MarkerArray out;
   out.markers.push_back(std::move(observed));
   out.markers.push_back(std::move(model_valid));
-  voxel_markers_pub_.publish(out);
+  voxel_markers_pub_->publish(out);
 }
 
 void FlowTemporalRosBridge::publishMergeEvents(double timestamp_s) {
@@ -316,7 +325,7 @@ void FlowTemporalRosBridge::publishMergeEvents(double timestamp_s) {
   }
 
   if (events.empty() || !loop_closure_merges_pub_ ||
-      loop_closure_merges_pub_.getNumSubscribers() == 0) {
+      loop_closure_merges_pub_->get_subscription_count() == 0) {
     return;
   }
 
@@ -325,15 +334,16 @@ void FlowTemporalRosBridge::publishMergeEvents(double timestamp_s) {
     return;
   }
   const double vs = static_cast<double>(voxel_size);
-  const ros::Duration lifetime(config.loop_closure_merge_marker_lifetime_s);
+  const auto lifetime =
+      rclcpp::Duration::from_seconds(config.loop_closure_merge_marker_lifetime_s);
 
-  visualization_msgs::Marker sources;
+  Marker sources;
   sources.header.frame_id = config.world_frame;
-  sources.header.stamp = ros::Time::now();
+  sources.header.stamp = nh_.now();
   sources.ns = "loop_closure_merge_sources";
   sources.id = 0;
-  sources.type = visualization_msgs::Marker::CUBE_LIST;
-  sources.action = visualization_msgs::Marker::ADD;
+  sources.type = Marker::CUBE_LIST;
+  sources.action = Marker::ADD;
   sources.pose.orientation.w = 1.0;
   sources.scale.x = sources.scale.y = sources.scale.z = vs;
   sources.color.r = 1.0f;
@@ -342,17 +352,17 @@ void FlowTemporalRosBridge::publishMergeEvents(double timestamp_s) {
   sources.color.a = 0.7f;
   sources.lifetime = lifetime;
 
-  visualization_msgs::Marker targets = sources;
+  Marker targets = sources;
   targets.ns = "loop_closure_merge_targets";
   targets.id = 1;
   targets.color.r = 0.2f;
   targets.color.g = 1.0f;
   targets.color.b = 0.3f;
 
-  visualization_msgs::Marker links = sources;
+  Marker links = sources;
   links.ns = "loop_closure_merge_links";
   links.id = 2;
-  links.type = visualization_msgs::Marker::LINE_LIST;
+  links.type = Marker::LINE_LIST;
   links.scale.x = vs * 0.1;
   links.scale.y = 0.0;
   links.scale.z = 0.0;
@@ -362,7 +372,7 @@ void FlowTemporalRosBridge::publishMergeEvents(double timestamp_s) {
   links.color.a = 0.9f;
 
   const auto index_to_point = [vs](const GlobalIndex& idx) {
-    geometry_msgs::Point p;
+    geometry_msgs::msg::Point p;
     p.x = (static_cast<double>(idx.x()) + 0.5) * vs;
     p.y = (static_cast<double>(idx.y()) + 0.5) * vs;
     p.z = (static_cast<double>(idx.z()) + 0.5) * vs;
@@ -382,11 +392,11 @@ void FlowTemporalRosBridge::publishMergeEvents(double timestamp_s) {
     links.points.push_back(pt);
   }
 
-  visualization_msgs::MarkerArray out;
+  MarkerArray out;
   out.markers.push_back(std::move(sources));
   out.markers.push_back(std::move(targets));
   out.markers.push_back(std::move(links));
-  loop_closure_merges_pub_.publish(out);
+  loop_closure_merges_pub_->publish(out);
   (void)timestamp_s;
 }
 
@@ -410,7 +420,7 @@ void FlowTemporalRosBridge::publishMetrics(double timestamp_s) {
   const size_t place_nodes_with_components = core_.placeNodesWithComponents();
   const size_t place_summaries_places_count = core_.placeSummariesPlacesCount();
 
-  std_msgs::String metrics;
+  std_msgs::msg::String metrics;
   if (config.debug_metrics_nodes_only) {
     nlohmann::json out;
     out["timestamp_s"] = timestamp_s;
@@ -476,7 +486,7 @@ void FlowTemporalRosBridge::publishMetrics(double timestamp_s) {
     out["recent_merge_events"] = events_json;
 
     metrics.data = out.dump();
-    metrics_pub_.publish(metrics);
+    metrics_pub_->publish(metrics);
     return;
   }
 
@@ -499,7 +509,7 @@ void FlowTemporalRosBridge::publishMetrics(double timestamp_s) {
      << " method=fixed"
      << " timestamp_s=" << timestamp_s;
   metrics.data = ss.str();
-  metrics_pub_.publish(metrics);
+  metrics_pub_->publish(metrics);
 }
 
 }  // namespace kairos
